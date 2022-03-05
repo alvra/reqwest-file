@@ -15,7 +15,7 @@
 //!
 //! let client = reqwest::Client::new();
 //! let request = client.get("http://httpbin.org/base64/aGVsbG8gd29ybGQ=");
-//! let mut file = RequestFile::new(request);
+//! let mut file: RequestFile = RequestFile::new(request);
 //!
 //! let mut buffer = [0; 5];
 //! assert_eq!(file.read(&mut buffer).await.unwrap(), 5);
@@ -126,16 +126,16 @@ fn send_request(request: &RequestBuilder, offset: u64) -> RequestStreamFuture {
 ///
 /// Return `Ok` if the fastforward is complete,
 /// or if EOF is reached (at the first empty read).
-fn fastforward<R: AsyncRead>(
+fn fastforward<R: AsyncRead, const BUFFER: usize>(
     mut reader: Pin<&mut R>,
     delta: u64,
     context: &mut Context<'_>,
 ) -> (u64, u64, Poll<Result<(), IoError>>) {
-    let mut array = [std::mem::MaybeUninit::uninit(); FF_BUFFER];
+    let mut array = [std::mem::MaybeUninit::uninit(); BUFFER];
     let mut remaining = delta;
     let poll = loop {
         assert!(remaining > 0);
-        let buffer_size = (remaining as usize).min(FF_BUFFER);
+        let buffer_size = (remaining as usize).min(BUFFER);
         let mut buffer = ReadBuf::uninit(&mut array[0..buffer_size]);
         match reader.as_mut().poll_read(context, &mut buffer) {
             Poll::Ready(Ok(())) => {
@@ -160,10 +160,10 @@ fn fastforward<R: AsyncRead>(
 }
 
 /// The maximum fast-forward read length.
-const FF_WINDOW: u64 = 128 * 1024;
+const DEFAULT_FF_WINDOW: u64 = 128 * 1024;
 
 /// The size of the fast-forward read buffer.
-const FF_BUFFER: usize = 4096;
+const DEFAULT_FF_BUFFER: usize = 4096;
 
 /// State of the request file.
 enum State<P, R> {
@@ -236,19 +236,35 @@ enum State<P, R> {
 /// ## Fast-Forward
 ///
 /// As an optimization, seeking forward by a small amount
-/// (currently less than 128KiB) will not perform
+/// (by default up to 128KiB) will not perform
 /// a new request, but rather fast-forward through
 /// the response body.
 ///
 /// This type of seek is always allowed,
-/// even if the webserver does not support `Range` requests
+/// even if the webserver does not support `Range` requests.
+///
+/// ###### Customization
+///
+/// The settings for fast-forwards can be changed through
+/// two constant parameters.
+///
+///   * `FF_WINDOW` limits how much can be fast-forwarded;
+///     only seeking up to this number of bytes forwards
+///     will read through the request (discarding the data)
+///     to avoid sending out a new request.
+///
+///   * `FF_BUFFER` defines the internal buffer size
+///     used to read into during a fast-foward.
 ///
 /// [`NotSeekable`]: std::io::ErrorKind::NotSeekable
 /// [`Unsupported`]: std::io::ErrorKind::Unsupported
 /// [`InvalidInput`]: std::io::ErrorKind::InvalidInput
 /// [`Other`]: std::io::ErrorKind::Other
 #[pin_project(project = RequestFileProjection)]
-pub struct RequestFile {
+pub struct RequestFile<
+    const FF_WINDOW: u64 = DEFAULT_FF_WINDOW,
+    const FF_BUFFER: usize = DEFAULT_FF_BUFFER,
+> {
     /// The request template.
     request: RequestBuilder,
     /// The state of the HTTP request.
@@ -259,7 +275,11 @@ pub struct RequestFile {
     position: u64,
 }
 
-impl RequestFile {
+impl<
+    const FF_WINDOW: u64,
+    const FF_BUFFER: usize,
+>
+RequestFile<FF_WINDOW, FF_BUFFER> {
     /// Create a new file-like object for a web resource.
     ///
     /// # Panics
@@ -328,7 +348,11 @@ impl RequestFile {
     }
 }
 
-impl RequestFileProjection<'_> {
+impl<
+    const FF_WINDOW: u64,
+    const FF_BUFFER: usize,
+>
+RequestFileProjection<'_, FF_WINDOW, FF_BUFFER> {
     /// Compute the absolute seek position.
     fn resolve_seek_position(
         &self,
@@ -396,7 +420,7 @@ impl RequestFileProjection<'_> {
     ) -> Poll<Result<(), IoError>> {
         match std::mem::replace(self.state, State::Transient) {
             State::Seeking(mut reader, delta) => {
-                let (read, remaining, poll) = fastforward(
+                let (read, remaining, poll) = fastforward::<_, {FF_BUFFER}>(
                     reader.as_mut(), delta, context);
                 *self.position = self.position.saturating_add(read);
                 match poll {
@@ -443,7 +467,8 @@ impl RequestFileProjection<'_> {
     }
 }
 
-impl AsyncRead for RequestFile {
+impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncRead
+for RequestFile<FF_WINDOW, FF_BUFFER> {
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -467,7 +492,8 @@ impl AsyncRead for RequestFile {
     }
 }
 
-impl AsyncSeek for RequestFile {
+impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncSeek
+for RequestFile<FF_WINDOW, FF_BUFFER> {
     fn start_seek(
         self: Pin<&mut Self>,
         position: SeekFrom,
@@ -590,13 +616,41 @@ mod tests {
     macro_rules! test {
         (
             $name:ident
-            [ $( SeekFrom::$seek_from:ident($offset:literal) => ( $($tell:tt)* ) );* $(;)? ]
+            $( $token:tt )*
+        ) => {
+            // Make versions of the test for various const param combos.
+            test!(
+                @concrete
+                $name
+                $( $token )*
+            );
+            test!(
+                @concrete
+                @ff_window 2
+                @ff_buffer 1
+                $name
+                $( $token )*
+            );
+        };
+        (
+            @concrete
+            $( @ff_window $ff_window:literal )?
+            $( @ff_buffer $ff_buffer:literal )?
+            $name:ident
+            [
+                $( SeekFrom::$seek_from:ident($offset:literal)
+                => ( $($tell:tt)* ) );* $(;)?
+            ]
             $( Content-Length = $content_length:literal )?
             $( Content-Range = $content_range:literal )?
             $data:literal => $result:tt
-        ) => {
+        ) => { paste::paste! {
             #[tokio::test]
-            async fn $name() {
+            async fn [<
+                $name
+                $( _ff_window_ $ff_window )?
+                $( _ff_buffer_ $ff_buffer )?
+            >]() {
                 let url = start_server();
                 let data = $data;
                 let client = reqwest::Client::new();
@@ -615,7 +669,12 @@ mod tests {
                 )?
 
                 let request = client.get(format!("{url}/?data={data}{params}"));
-                let mut file = RequestFile::new(request);
+                const FF_WINDOW: u64 = super::DEFAULT_FF_WINDOW
+                    $( + $ff_window - super::DEFAULT_FF_WINDOW )?;
+                const FF_BUFFER: usize = super::DEFAULT_FF_BUFFER
+                    $( + $ff_buffer - super::DEFAULT_FF_BUFFER )?;
+                let mut file: RequestFile::<FF_WINDOW, FF_BUFFER>
+                    = RequestFile::new(request);
 
                 $(
                     let seek_from = SeekFrom::$seek_from($offset);
@@ -627,7 +686,7 @@ mod tests {
                 let read_result = file.read_to_string(&mut response_data).await;
                 test!(@check_read read_result response_data $result);
             }
-        };
+        }};
         (
             @check_seek $seek:ident $result:literal
         ) => {
@@ -829,7 +888,7 @@ mod tests {
         let client = reqwest::Client::new();
         let data = "abc";
         let request = client.get(format!("{url}/?data={data}"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         let mut response_data = String::new();
         file.read_to_string(&mut response_data).await.expect("read error");
@@ -846,7 +905,7 @@ mod tests {
         let client = reqwest::Client::new();
         let data = "abcd";
         let request = client.get(format!("{url}/?data={data}"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         assert_eq!(file.size(), None);
         file.prepare().await.unwrap();
@@ -859,7 +918,7 @@ mod tests {
         let client = reqwest::Client::new();
         let data = "abcd";
         let request = client.get(format!("{url}/?data={data}&content_length=true"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         assert_eq!(file.size(), None);
         file.seek(SeekFrom::Start(2)).await.unwrap();
@@ -872,7 +931,7 @@ mod tests {
         let client = reqwest::Client::new();
         let data = "abcd";
         let request = client.get(format!("{url}/?data={data}&content_range=true"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         assert_eq!(file.size(), None);
         file.seek(SeekFrom::Start(2)).await.unwrap();
@@ -885,7 +944,7 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let request = client.get(format!("{url}/404"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         match file.prepare().await {
             Ok(()) => unreachable!(),
@@ -906,7 +965,7 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let request = client.get(format!("{url}/?data=abc&status=204"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         match file.prepare().await {
             Ok(()) => unreachable!(),
@@ -926,7 +985,7 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let request = client.get(format!("{url}/no-range-support"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         file.seek(SeekFrom::Start(0)).await.expect("seek error");
         let data = read(&mut file).await.expect("read error");
@@ -939,7 +998,7 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let request = client.get(format!("{url}/no-range-support"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         // seek beyond the fastforward window
         file.seek(SeekFrom::Start(1_000_000_000)).await.expect("seek error");
@@ -950,7 +1009,7 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let request = client.get(format!("{url}/?data=abc"));
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
 
         let seek_from = SeekFrom::Start(u64::MAX - 10);
         let pos = file.seek(seek_from).await.expect("seek error");
@@ -965,7 +1024,7 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let request = client.get(format!("{url}/?data=abc"));
-        let mut file = RequestFile::with_size(request, u64::MAX - 10);
+        let mut file: RequestFile = RequestFile::with_size(request, u64::MAX - 10);
 
         let pos = file.seek(SeekFrom::End(20)).await.expect("seek error");
         assert_eq!(pos, u64::MAX);
@@ -975,7 +1034,7 @@ mod tests {
     async fn test_reset() {
         let client = reqwest::Client::new();
         let request = client.get("http://example.com/");
-        let mut file = RequestFile::new(request);
+        let mut file: RequestFile = RequestFile::new(request);
         file.reset();
     }
 }
