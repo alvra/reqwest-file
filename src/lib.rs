@@ -29,20 +29,19 @@
 //! ```
 
 #![feature(type_alias_impl_trait, mixed_integer_ops, io_error_more)]
-
 #![forbid(unsafe_code)]
 
-use std::pin::Pin;
-use std::io::{SeekFrom, Error as IoError, ErrorKind};
-use std::task::{Poll, Context};
 use std::future::Future;
+use std::io::{Error as IoError, ErrorKind, SeekFrom};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use pin_project::pin_project;
 use futures_util::{FutureExt, Stream, StreamExt};
-use tokio::io::{ReadBuf, AsyncRead, AsyncSeek};
-use tokio_util::io::StreamReader;
+use pin_project::pin_project;
 use reqwest::{RequestBuilder, StatusCode};
+use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+use tokio_util::io::StreamReader;
 
 fn to_io_error(e: impl std::error::Error + Send + Sync + 'static) -> IoError {
     IoError::new(ErrorKind::Other, e)
@@ -62,32 +61,42 @@ impl std::error::Error for HttpResponseStatusError {}
 // Unfortunately, `reqwest::Response::bytes_stream()` returns
 // an unnamed type. Since we need to store this type,
 // we need to be able to name it, thus requiring the TAIT here.
-type RequestStream = impl Stream<Item=Result<Bytes, IoError>>;
-type RequestStreamFuture = impl Future<Output=Result<
-    (Option<u64>, RequestStream),
-    IoError,
->>;
+type RequestStream = impl Stream<Item = Result<Bytes, IoError>>;
+type StreamData = (Option<u64>, RequestStream);
+type RequestStreamFuture = impl Future<Output = Result<StreamData, IoError>>;
 
 fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers.get(reqwest::header::CONTENT_LENGTH)?
-        .to_str().ok()?
-        .parse::<u64>().ok()
+    headers
+        .get(reqwest::header::CONTENT_LENGTH)?
+        // convert to str (eg. "123")
+        .to_str()
+        .ok()?
+        // convert to an integer
+        .parse::<u64>()
+        .ok()
 }
 
 fn parse_range_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers.get(reqwest::header::CONTENT_RANGE)?
-        .to_str().ok()?
-        .split_once('/')?.1
-        .parse::<u64>().ok()
+    headers
+        .get(reqwest::header::CONTENT_RANGE)?
+        // convert to str (eg. "bytes 3-5/7")
+        .to_str()
+        .ok()?
+        // take the part after '/'
+        .split_once('/')?
+        .1
+        // convert to an integer
+        .parse::<u64>()
+        .ok()
 }
 
 fn determine_size(offset: u64, response: &reqwest::Response) -> Option<u64> {
     if response.status() == StatusCode::OK {
         parse_content_length(response.headers())
     } else if response.status() == StatusCode::PARTIAL_CONTENT {
-        parse_range_length(response.headers())
-            .or_else(|| parse_content_length(response.headers())
-                    .map(|size| offset + size))
+        parse_range_length(response.headers()).or_else(|| {
+            parse_content_length(response.headers()).map(|size| offset + size)
+        })
     } else {
         unreachable!()
     }
@@ -96,29 +105,33 @@ fn determine_size(offset: u64, response: &reqwest::Response) -> Option<u64> {
 /// Send a request with a `Range` header,
 /// returning a future for the response stream.
 fn send_request(request: &RequestBuilder, offset: u64) -> RequestStreamFuture {
-    let request = request.try_clone().expect("request contains streaming body");
+    let request = request
+        .try_clone()
+        .expect("request contains streaming body");
     request
         .header(reqwest::header::RANGE, format!("bytes={offset}-"))
         .send()
-        .map(move |result| result
-            .and_then(|response| response.error_for_status())            
-            .map_err(to_io_error)
-            .and_then(|response| {
-                if response.status() == StatusCode::OK {
-                    if offset != 0 {
-                        return Err(ErrorKind::NotSeekable.into())
+        .map(move |result| {
+            result
+                .and_then(|response| response.error_for_status())
+                .map_err(to_io_error)
+                .and_then(|response| {
+                    if response.status() == StatusCode::OK {
+                        if offset != 0 {
+                            return Err(ErrorKind::NotSeekable.into());
+                        }
+                    } else if response.status() != StatusCode::PARTIAL_CONTENT {
+                        let error = HttpResponseStatusError(response.status());
+                        return Err(to_io_error(error));
                     }
-                } else if response.status() != StatusCode::PARTIAL_CONTENT {
-                    let error = HttpResponseStatusError(response.status());
-                    return Err(to_io_error(error))
-                }
-                let size = determine_size(offset, &response);
-                let stream = response.bytes_stream().map(|result|
-                    result.map_err(to_io_error));
+                    let size = determine_size(offset, &response);
+                    let stream = response
+                        .bytes_stream()
+                        .map(|result| result.map_err(to_io_error));
 
-                Ok((size, stream))
-            })
-        )
+                    Ok((size, stream))
+                })
+        })
 }
 
 /// Try to read `delta` bytes from a stream,
@@ -142,16 +155,16 @@ fn fastforward<R: AsyncRead, const BUFFER: usize>(
                 let read = buffer.filled().len() as u64;
                 if read == 0 {
                     // reached EOF
-                    break Poll::Ready(Ok(()))
+                    break Poll::Ready(Ok(()));
                 } else {
                     remaining = remaining.checked_sub(read).unwrap();
                     if remaining == 0 {
-                        break Poll::Ready(Ok(()))
+                        break Poll::Ready(Ok(()));
                     } else {
-                        continue
+                        continue;
                     }
                 }
-            },
+            }
             other => break other,
         }
     };
@@ -275,11 +288,9 @@ pub struct RequestFile<
     position: u64,
 }
 
-impl<
-    const FF_WINDOW: u64,
-    const FF_BUFFER: usize,
->
-RequestFile<FF_WINDOW, FF_BUFFER> {
+impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
+    RequestFile<FF_WINDOW, FF_BUFFER>
+{
     /// Create a new file-like object for a web resource.
     ///
     /// # Panics
@@ -314,10 +325,16 @@ RequestFile<FF_WINDOW, FF_BUFFER> {
         size: impl Into<Option<u64>>,
     ) -> Self {
         request
-            .try_clone().expect("request contains streaming body")
-            .build().expect("invalid request")
-            .headers().contains_key(reqwest::header::RANGE).then(||
-                panic!("request already has range header set"));
+            // Ensure it can be cloned.
+            .try_clone()
+            .expect("request contains streaming body")
+            // Ensure is valid.
+            .build()
+            .expect("invalid request")
+            // Ensure it does not already contain a range header.
+            .headers()
+            .contains_key(reqwest::header::RANGE)
+            .then(|| panic!("request already has range header set"));
         Self {
             request,
             state: State::Initial,
@@ -348,11 +365,9 @@ RequestFile<FF_WINDOW, FF_BUFFER> {
     }
 }
 
-impl<
-    const FF_WINDOW: u64,
-    const FF_BUFFER: usize,
->
-RequestFileProjection<'_, FF_WINDOW, FF_BUFFER> {
+impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
+    RequestFileProjection<'_, FF_WINDOW, FF_BUFFER>
+{
     /// Compute the absolute seek position.
     fn resolve_seek_position(
         &self,
@@ -375,9 +390,10 @@ RequestFileProjection<'_, FF_WINDOW, FF_BUFFER> {
                     // size not known
                     Err(ErrorKind::Unsupported.into())
                 }
-            },
+            }
             SeekFrom::Current(delta) => {
-                if let Some(position) = self.position.checked_add_signed(delta) {
+                if let Some(position) = self.position.checked_add_signed(delta)
+                {
                     Ok(position)
                 } else if delta > 0 {
                     // seek overflow; wrap to maximum
@@ -386,7 +402,7 @@ RequestFileProjection<'_, FF_WINDOW, FF_BUFFER> {
                     // seek to negative position
                     Err(ErrorKind::InvalidInput.into())
                 }
-            },
+            }
         }
     }
 
@@ -420,8 +436,11 @@ RequestFileProjection<'_, FF_WINDOW, FF_BUFFER> {
     ) -> Poll<Result<(), IoError>> {
         match std::mem::replace(self.state, State::Transient) {
             State::Seeking(mut reader, delta) => {
-                let (read, remaining, poll) = fastforward::<_, {FF_BUFFER}>(
-                    reader.as_mut(), delta, context);
+                let (read, remaining, poll) = fastforward::<_, { FF_BUFFER }>(
+                    reader.as_mut(),
+                    delta,
+                    context,
+                );
                 *self.position = self.position.saturating_add(read);
                 match poll {
                     Poll::Ready(Ok(())) => {
@@ -429,17 +448,17 @@ RequestFileProjection<'_, FF_WINDOW, FF_BUFFER> {
                         *self.position = self.position.wrapping_add(remaining);
                         *self.state = State::Ready(reader);
                         Poll::Ready(Ok(()))
-                    },
+                    }
                     other => {
                         *self.state = State::Seeking(reader, remaining);
                         other
-                    },
+                    }
                 }
             }
             state => {
                 *self.state = state;
                 Poll::Ready(Ok(()))
-            },
+            }
         }
     }
 
@@ -451,16 +470,16 @@ RequestFileProjection<'_, FF_WINDOW, FF_BUFFER> {
         use futures_util::ready;
 
         self.drive_initial();
-        assert!(! matches!(self.state, State::Initial));
+        assert!(!matches!(self.state, State::Initial));
 
         ready!(self.poll_drive_pending(context))?;
-        assert!(! matches!(self.state, State::Initial));
-        assert!(! matches!(self.state, State::Pending(_)));
+        assert!(!matches!(self.state, State::Initial));
+        assert!(!matches!(self.state, State::Pending(_)));
 
         ready!(self.poll_drive_seeking(context))?;
-        assert!(! matches!(self.state, State::Initial));
-        assert!(! matches!(self.state, State::Pending(_)));
-        assert!(! matches!(self.state, State::Seeking(_, _)));
+        assert!(!matches!(self.state, State::Initial));
+        assert!(!matches!(self.state, State::Pending(_)));
+        assert!(!matches!(self.state, State::Seeking(_, _)));
 
         assert!(matches!(self.state, State::Ready(_)));
         Poll::Ready(Ok(()))
@@ -468,32 +487,33 @@ RequestFileProjection<'_, FF_WINDOW, FF_BUFFER> {
 }
 
 impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncRead
-for RequestFile<FF_WINDOW, FF_BUFFER> {
+    for RequestFile<FF_WINDOW, FF_BUFFER>
+{
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>
+        buffer: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), IoError>> {
         let mut this = self.project();
         let reader = match this.poll_drive(context) {
-            Poll::Ready(Ok(())) => {
-                match this.state {
-                    State::Ready(reader) => reader.as_mut(),
-                    _ => unreachable!(),
-                }
+            Poll::Ready(Ok(())) => match this.state {
+                State::Ready(reader) => reader.as_mut(),
+                _ => unreachable!(),
             },
             other => return other.map_ok(|_| ()),
         };
         let initial_size = buffer.filled().len();
         reader.poll_read(context, buffer).map_ok(|_| {
-            let delta = buffer.filled().len().checked_sub(initial_size).unwrap();
+            let delta =
+                buffer.filled().len().checked_sub(initial_size).unwrap();
             *this.position += this.position.saturating_add(delta as u64);
         })
     }
 }
 
 impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncSeek
-for RequestFile<FF_WINDOW, FF_BUFFER> {
+    for RequestFile<FF_WINDOW, FF_BUFFER>
+{
     fn start_seek(
         self: Pin<&mut Self>,
         position: SeekFrom,
@@ -505,7 +525,9 @@ for RequestFile<FF_WINDOW, FF_BUFFER> {
             let delta_forward = final_position.saturating_sub(initial_position);
             if 0 < delta_forward && delta_forward <= FF_WINDOW {
                 // seeking forwards by a small leap
-                if let State::Ready(reader) = std::mem::replace(this.state, State::Transient) {
+                if let State::Ready(reader) =
+                    std::mem::replace(this.state, State::Transient)
+                {
                     *this.state = State::Seeking(reader, delta_forward);
                 } else {
                     *this.position = final_position;
@@ -521,20 +543,19 @@ for RequestFile<FF_WINDOW, FF_BUFFER> {
     }
 
     fn poll_complete(
-        self: Pin<&mut Self>, 
-        context: &mut Context<'_>
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
     ) -> Poll<Result<u64, IoError>> {
         let mut this = self.project();
         this.poll_drive(context).map_ok(|_| *this.position)
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::RequestFile;
     use std::io::SeekFrom;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    use super::RequestFile;
 
     #[derive(Debug, serde::Deserialize)]
     pub struct QueryParams {
@@ -552,7 +573,12 @@ mod tests {
         axum::http::header::HeaderMap,
         impl axum::response::IntoResponse,
     ) {
-        use axum::http::{self, StatusCode, header::{HeaderMap, HeaderValue}};
+        use axum::http::{
+            self,
+            header::{HeaderMap, HeaderValue},
+            StatusCode,
+        };
+
         let mut headers = HeaderMap::new();
 
         let range = range_header.iter().next().expect("empty range header");
@@ -563,9 +589,8 @@ mod tests {
             unreachable!()
         };
 
-        let response = query.data.chars()
-            .skip(offset as usize)
-            .collect::<String>();
+        let response =
+            query.data.chars().skip(offset as usize).collect::<String>();
         if query.content_range.unwrap_or(false) {
             let content_range = format!("bytes {offset}-{data_len}/{data_len}");
             headers.insert(
@@ -580,14 +605,13 @@ mod tests {
                 HeaderValue::from_str(&content_length).unwrap(),
             );
         }
-        let status = StatusCode::from_u16(
-            query.status.unwrap_or(StatusCode::PARTIAL_CONTENT.as_u16()))
-                .expect("invalid status code");
+        let default_status = StatusCode::PARTIAL_CONTENT.as_u16();
+        let status = query.status.unwrap_or(default_status);
+        let status = StatusCode::from_u16(status).expect("invalid status code");
         // Stream the response so axum won't add a content-length header.
-        let response = axum::body::StreamBody::new(
-            futures_util::stream::iter(
-                std::iter::once(
-                    std::io::Result::Ok(response))));
+        let response = axum::body::StreamBody::new(futures_util::stream::iter(
+            std::iter::once(std::io::Result::Ok(response)),
+        ));
         (status, headers, response)
     }
 
@@ -597,10 +621,11 @@ mod tests {
 
     fn start_server() -> String {
         let app = axum::Router::new()
-            .route("/",
-                axum::routing::get(web_page_main))
-            .route("/no-range-support",
-                axum::routing::get(web_page_no_range_support));
+            .route("/", axum::routing::get(web_page_main))
+            .route(
+                "/no-range-support",
+                axum::routing::get(web_page_no_range_support),
+            );
         let server = axum::Server::bind(&"0.0.0.0:0".parse().unwrap())
             .serve(app.into_make_service());
         let address = server.local_addr();
@@ -610,7 +635,9 @@ mod tests {
 
     async fn read(file: &mut RequestFile) -> Result<String, std::io::Error> {
         let mut response_data = String::new();
-        file.read_to_string(&mut response_data).await.map(|_| response_data)
+        file.read_to_string(&mut response_data)
+            .await
+            .map(|_| response_data)
     }
 
     macro_rules! test {
@@ -873,10 +900,12 @@ mod tests {
         use futures_util::future::poll_fn;
         use tokio::io::AsyncSeek;
         tokio::pin!(file);
-        file.as_mut().start_seek(SeekFrom::Start(4)).expect("start seek error");
-        let pos = poll_fn(|context|
-            file.as_mut().poll_complete(context)
-        ).await.expect("complete seek error");
+        file.as_mut()
+            .start_seek(SeekFrom::Start(4))
+            .expect("start seek error");
+        let pos = poll_fn(|context| file.as_mut().poll_complete(context))
+            .await
+            .expect("complete seek error");
         assert_eq!(pos, 4);
     }
 
@@ -891,11 +920,15 @@ mod tests {
         let mut file: RequestFile = RequestFile::new(request);
 
         let mut response_data = String::new();
-        file.read_to_string(&mut response_data).await.expect("read error");
+        file.read_to_string(&mut response_data)
+            .await
+            .expect("read error");
         assert_eq!(response_data, data);
         response_data.clear();
 
-        file.read_to_string(&mut response_data).await.expect("read error");
+        file.read_to_string(&mut response_data)
+            .await
+            .expect("read error");
         assert_eq!(response_data, "");
     }
 
@@ -917,7 +950,8 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let data = "abcd";
-        let request = client.get(format!("{url}/?data={data}&content_length=true"));
+        let url = format!("{url}/?data={data}&content_length=true");
+        let request = client.get(url);
         let mut file: RequestFile = RequestFile::new(request);
 
         assert_eq!(file.size(), None);
@@ -930,7 +964,8 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let data = "abcd";
-        let request = client.get(format!("{url}/?data={data}&content_range=true"));
+        let url = format!("{url}/?data={data}&content_range=true");
+        let request = client.get(url);
         let mut file: RequestFile = RequestFile::new(request);
 
         assert_eq!(file.size(), None);
@@ -1001,7 +1036,9 @@ mod tests {
         let mut file: RequestFile = RequestFile::new(request);
 
         // seek beyond the fastforward window
-        file.seek(SeekFrom::Start(1_000_000_000)).await.expect("seek error");
+        file.seek(SeekFrom::Start(1_000_000_000))
+            .await
+            .expect("seek error");
     }
 
     #[tokio::test]
@@ -1024,7 +1061,8 @@ mod tests {
         let url = start_server();
         let client = reqwest::Client::new();
         let request = client.get(format!("{url}/?data=abc"));
-        let mut file: RequestFile = RequestFile::with_size(request, u64::MAX - 10);
+        let mut file: RequestFile =
+            RequestFile::with_size(request, u64::MAX - 10);
 
         let pos = file.seek(SeekFrom::End(20)).await.expect("seek error");
         assert_eq!(pos, u64::MAX);
