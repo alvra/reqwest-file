@@ -1,12 +1,13 @@
 name: Security Audit
 
 on:
-  push
+  push:
   schedule:
     - cron: '0 0 * * *'
 
 jobs:
   cargo_audit:
+    name: "Cargo Audit"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository

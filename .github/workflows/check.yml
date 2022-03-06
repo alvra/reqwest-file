@@ -4,6 +4,7 @@ on: [push, pull_request]
 
 jobs:
   rustfmt:
+    name: "Format"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -11,15 +12,16 @@ jobs:
       - name: Install Rust Nightly Toolchain
         uses: actions-rs/toolchain@v1
         with:
-            toolchain: nightly
-            override: true
-            components: rustfmt
+          toolchain: nightly
+          override: true
+          components: rustfmt
       - name: Run Cargo Fmt
         uses: mbrobbel/rustfmt-check@master
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   clippy:
+    name: "Clippy"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -27,9 +29,9 @@ jobs:
       - name: Install Rust Nightly Toolchain
         uses: actions-rs/toolchain@v1
         with:
-            toolchain: nightly
-            override: true
-            components: clippy
+          toolchain: nightly
+          override: true
+          components: clippy
       - name: Run Cargo Clippy
         uses: actions-rs/clippy-check@v1
         with:
@@ -37,6 +39,7 @@ jobs:
           args: --all-features --all-targets
 
   test:
+    name: "Test"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -44,14 +47,16 @@ jobs:
       - name: Install Rust Nightly Toolchain
         uses: actions-rs/toolchain@v1
         with:
-            toolchain: nightly
-            override: true
+          toolchain: nightly
+          override: true
       - name: Run Cargo Test
         uses: actions-rs/cargo@v1
         with:
           command: test
+          args: --verbose --workspace --all-features --all-targets
 
-  doc:
+  test_docs:
+    name: "Test Docs"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -59,15 +64,33 @@ jobs:
       - name: Install Rust Nightly Toolchain
         uses: actions-rs/toolchain@v1
         with:
-            toolchain: nightly
-            override: true
-            components: doc
+          toolchain: nightly
+          override: true
+      - name: Run Cargo Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --verbose --workspace --all-features --doc
+
+  doc:
+    name: "Build Docs"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Install Rust Nightly Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
       - name: Run Cargo Doc
         uses: actions-rs/cargo@v1
         with:
           command: doc
+          args: --workspace --all-features
 
-  coverage_llvm:
+  coverage_llvmcov:
+    name: "Coverage LlvmCov"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -75,14 +98,30 @@ jobs:
       - name: Install Rust Nightly Toolchain
         uses: actions-rs/toolchain@v1
         with:
-            toolchain: nightly
-            override: true
-            profile: minimal
-            components: llvm-tools-preview
-      - name: Run llvm-cov 
-        uses: swatinem/fucov@v1
+          toolchain: nightly
+          override: true
+          profile: minimal
+          components: llvm-tools-preview
+      - name: Run LlvmCov
+        id: coverage
+        uses: alvra/fucov@v2
+        with:
+          output-format: lcov
+          output-filename: coverage-report-llvmcov.lcov
+      - name: Archive Code Coverage Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report-llvmcov.lcov
+          path: coverage-report-llvmcov.lcov
+      - name: Report and Check Code Coverage
+        uses: zgosalvez/github-actions-report-lcov@v1
+        with:
+          coverage-files: coverage-report-llvmcov.lcov
+          minimum-coverage: 90
+          artifact-name: coverage-report-llvmcov.html
 
   coverage_tarpaulin:
+    name: "Coverage Tarpaulin"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -90,12 +129,30 @@ jobs:
       - name: Install Rust Nightly Toolchain
         uses: actions-rs/toolchain@v1
         with:
-            toolchain: nightly
-            override: true
+          toolchain: nightly
+          override: true
       - name: Run Cargo Tarpaulin
+        id: coverage
         uses: actions-rs/tarpaulin@v0.1
+        with:
+          out-type: lcov
+          args: --workspace --no-fail-fast --branch
+      - name: Rename Code Coverage Report
+        run: mv lcov.info coverage-report-tarpaulin.lcov
+      - name: Archive Code Coverage Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report-tarpaulin.lcov
+          path: coverage-report-tarpaulin.lcov
+      - name: Report and Check Code Coverage
+        uses: zgosalvez/github-actions-report-lcov@v1
+        with:
+          coverage-files: coverage-report-tarpaulin.lcov
+          minimum-coverage: 90
+          artifact-name: coverage-report-tarpaulin.html
 
   coverage_grcov:
+    name: "Coverage GrCov"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -103,9 +160,14 @@ jobs:
       - name: Install Rust Nightly Toolchain
         uses: actions-rs/toolchain@v1
         with:
-            toolchain: nightly
-            override: true
-      - name: Run Cargo Test
+          toolchain: nightly
+          override: true
+      - name: Define GrCov Config
+        run: >
+          echo -e
+          "branch: true\noutput-type: lcov\nignore: ['/rustc/*', '/home/runner/.cargo/registry/src/*', '/cargo/registry/*']\noutput-path: coverage-report-grcov.lcov"
+          > grcov-config.yml
+      - name: Run Cargo Test with Coverage
         uses: actions-rs/cargo@v1
         with:
           command: test
@@ -113,6 +175,20 @@ jobs:
         env:
           CARGO_INCREMENTAL: '0'
           RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
-          RUSTDOCFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests's
+          RUSTDOCFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
       - name: Run GrCov
+        id: coverage
         uses: actions-rs/grcov@v0.1
+        with:
+          config: grcov-config.yml
+      - name: Archive Code Coverage Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report-grcov.lcov
+          path: coverage-report-grcov.lcov
+      - name: Report and Check Code Coverage
+        uses: zgosalvez/github-actions-report-lcov@v1
+        with:
+          coverage-files: coverage-report-grcov.lcov
+          minimum-coverage: 90
+          artifact-name: coverage-report-grcov.html
