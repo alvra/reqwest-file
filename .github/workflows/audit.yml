@@ -1,0 +1,17 @@
+name: Security Audit
+
+on:
+  push
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  cargo_audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Run Cargo Audit
+        uses: actions-rs/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,118 @@
+name: Code Check
+
+on: [push, pull_request]
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Install Rust Nightly Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: nightly
+            override: true
+            components: rustfmt
+      - name: Run Cargo Fmt
+        uses: mbrobbel/rustfmt-check@master
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Install Rust Nightly Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: nightly
+            override: true
+            components: clippy
+      - name: Run Cargo Clippy
+        uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --all-features --all-targets
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Install Rust Nightly Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: nightly
+            override: true
+      - name: Run Cargo Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Install Rust Nightly Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: nightly
+            override: true
+            components: doc
+      - name: Run Cargo Doc
+        uses: actions-rs/cargo@v1
+        with:
+          command: doc
+
+  coverage_llvm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Install Rust Nightly Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: nightly
+            override: true
+            profile: minimal
+            components: llvm-tools-preview
+      - name: Run llvm-cov 
+        uses: swatinem/fucov@v1
+
+  coverage_tarpaulin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Install Rust Nightly Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: nightly
+            override: true
+      - name: Run Cargo Tarpaulin
+        uses: actions-rs/tarpaulin@v0.1
+
+  coverage_grcov:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+      - name: Install Rust Nightly Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: nightly
+            override: true
+      - name: Run Cargo Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all-features --all-targets
+        env:
+          CARGO_INCREMENTAL: '0'
+          RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
+          RUSTDOCFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests's
+      - name: Run GrCov
+        uses: actions-rs/grcov@v0.1
