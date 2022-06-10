@@ -506,7 +506,7 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncRead
         reader.poll_read(context, buffer).map_ok(|_| {
             let delta =
                 buffer.filled().len().checked_sub(initial_size).unwrap();
-            *this.position += this.position.saturating_add(delta as u64);
+            *this.position = this.position.saturating_add(delta as u64);
         })
     }
 }
