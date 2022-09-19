@@ -148,7 +148,7 @@ jobs:
         uses: zgosalvez/github-actions-report-lcov@v1
         with:
           coverage-files: coverage-report-tarpaulin.lcov
-          minimum-coverage: 90
+          minimum-coverage: 75
           artifact-name: coverage-report-tarpaulin.html
 
   coverage_grcov:
