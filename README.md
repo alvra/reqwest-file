@@ -11,6 +11,7 @@ Use web resources like regular async files.
 
   * No unsafe code (`#[forbid(unsafe_code)]`)
   * Tested; code coverage: 100%
+  * Supports either `futures_util::io::{AsyncRead, AsyncSeek}` or `tokio::io::{AsyncRead, AsyncSeek}` (via feature flags)
 
 ## Example
 

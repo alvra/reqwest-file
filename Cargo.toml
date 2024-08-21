@@ -1,6 +1,6 @@
 [package]
 name = "reqwest-file"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Alexander van Ratingen"]
@@ -12,16 +12,21 @@ readme = "README.md"
 keywords = ["http", "request", "async"]
 
 [dependencies]
-bytes = "1.1.0"
-pin-project = "1.0.10"
-futures-util = "0.3.21"
-tokio = { version = "1.16.1", default-features = false }
-tokio-util = { version = "0.7.0", default-features = false, features = ["io"] }
-reqwest = { version = "0.11.9", default-features = false, features = ["stream"] }
+bytes = "1.7"
+pin-project = "1.1"
+futures-util = "0.3"
+tokio = { version = "1.39", default-features = false, optional = true }
+tokio-util = { version = "0.7", default-features = false, features = ["io", "io-util"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+
+[features]
+nightly = []
+tokio_io = ["dep:tokio", "dep:tokio-util"]
+futures_io = ["futures-util/io"]
 
 [dev-dependencies]
-paste = "1.0.6"
-serde = { version = "1.0.136", default-features = false, features = ["derive"] }
-tokio = { version = "1.16.1", features = ["rt", "macros"] }
-tokio-test = "0.4.2"
-axum = { version = "0.5.16", default-features = false, features = ["headers", "query"] }
+paste = "1.0"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+tokio = { version = "1.39", features = ["rt", "macros"] }
+tokio-test = "0.4"
+axum = { version = "0.5", default-features = false, features = ["http1", "headers", "query"] }

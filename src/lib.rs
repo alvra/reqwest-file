@@ -5,6 +5,7 @@
 //!
 //!   * No unsafe code (`#[forbid(unsafe_code)]`)
 //!   * Tested; code coverage: 100%
+//!   * Supports either `futures_util::io::{AsyncRead, AsyncSeek}` or `tokio::io::{AsyncRead, AsyncSeek}` (via feature flags)
 //!
 //! # Examples
 //!
@@ -27,8 +28,7 @@
 //! assert_eq!(&buffer, b"world");
 //! # })
 //! ```
-
-#![feature(type_alias_impl_trait, mixed_integer_ops, io_error_more)]
+#![cfg_attr(feature = "nightly", feature(type_alias_impl_trait, io_error_more))]
 #![forbid(unsafe_code)]
 
 use std::future::Future;
@@ -36,11 +36,22 @@ use std::io::{Error as IoError, ErrorKind, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::inner::{send_request, RequestStream, RequestStreamFuture};
 use bytes::Bytes;
-use futures_util::{FutureExt, Stream, StreamExt};
+use futures_util::{ready, FutureExt, StreamExt};
 use pin_project::pin_project;
 use reqwest::{RequestBuilder, StatusCode};
-use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+
+#[cfg(feature = "futures_io")]
+use futures_util::io::{AsyncRead, AsyncSeek, AsyncSeekExt};
+#[cfg(feature = "futures_io")]
+use futures_util::stream::IntoAsyncRead;
+#[cfg(feature = "futures_io")]
+use futures_util::TryStreamExt;
+
+#[cfg(feature = "tokio_io")]
+use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, ReadBuf};
+#[cfg(feature = "tokio_io")]
 use tokio_util::io::StreamReader;
 
 fn to_io_error(e: impl std::error::Error + Send + Sync + 'static) -> IoError {
@@ -58,12 +69,122 @@ impl std::fmt::Display for HttpResponseStatusError {
 
 impl std::error::Error for HttpResponseStatusError {}
 
-// Unfortunately, `reqwest::Response::bytes_stream()` returns
-// an unnamed type. Since we need to store this type,
-// we need to be able to name it, thus requiring the TAIT here.
-type RequestStream = impl Stream<Item = Result<Bytes, IoError>>;
-type StreamData = (Option<u64>, RequestStream);
-type RequestStreamFuture = impl Future<Output = Result<StreamData, IoError>>;
+// Due to changes in TAIT handling, TAITs cannot remain unconstrained if they appear
+// in a signature. In the long run, the `#[defines]` attribute will be used to mark
+// defining methods. Until then, the current workaround is to move the TAIT declaration
+// as well as all methods that actually constrain its hidden type into its own submodule.
+// see: https://github.com/rust-lang/rust/pull/113169
+#[cfg(feature = "nightly")]
+mod inner {
+    use super::*;
+
+    // Unfortunately, `reqwest::Response::bytes_stream()` returns
+    // an unnamed type. Since we need to store this type,
+    // we need to be able to name it, thus requiring the TAIT here.
+    pub type RequestStream =
+        impl futures_util::Stream<Item = Result<Bytes, IoError>>;
+    pub type StreamData = (Option<u64>, RequestStream);
+    pub type RequestStreamFuture =
+        impl Future<Output = Result<StreamData, IoError>>;
+
+    /// Send a request with a `Range` header,
+    /// returning a future for the response stream.
+    pub fn send_request(
+        request: &RequestBuilder,
+        offset: u64,
+        size: Option<u64>,
+    ) -> RequestStreamFuture {
+        let request = prepare_request(request, offset, size);
+        request.send().map(move |result| {
+            result
+                .and_then(|response| response.error_for_status())
+                .map_err(to_io_error)
+                .and_then(|response| {
+                    let size = process_response(&response, offset)?;
+                    let stream = response
+                        .bytes_stream()
+                        .map(|result| result.map_err(to_io_error));
+
+                    Ok((size, stream))
+                })
+        })
+    }
+}
+
+#[cfg(not(feature = "nightly"))]
+mod inner {
+    use super::*;
+    use futures_util::future::BoxFuture;
+    use futures_util::stream::BoxStream;
+
+    pub type RequestStream = BoxStream<'static, Result<Bytes, IoError>>;
+    pub type StreamData = (Option<u64>, RequestStream);
+    pub type RequestStreamFuture =
+        BoxFuture<'static, Result<StreamData, IoError>>;
+
+    /// Send a request with a `Range` header,
+    /// returning a future for the response stream.
+    pub fn send_request(
+        request: &RequestBuilder,
+        offset: u64,
+        size: Option<u64>,
+    ) -> RequestStreamFuture {
+        let request = prepare_request(request, offset, size);
+        Box::pin(request.send().map(move |result| {
+            result
+                .and_then(|response| response.error_for_status())
+                .map_err(to_io_error)
+                .and_then(|response| {
+                    let size = process_response(&response, offset)?;
+                    let stream = response
+                        .bytes_stream()
+                        .map(|result| result.map_err(to_io_error))
+                        .boxed();
+
+                    Ok((size, stream))
+                })
+        }))
+    }
+}
+
+fn prepare_request(
+    request: &RequestBuilder,
+    offset: u64,
+    size: Option<u64>,
+) -> RequestBuilder {
+    let range = match size {
+        Some(size) if size > 0 => {
+            let end = size - 1;
+            format!("bytes={offset}-{end}")
+        }
+        _ => {
+            format!("bytes={offset}-")
+        }
+    };
+
+    let request = request
+        .try_clone()
+        .expect("request contains streaming body");
+    request.header(reqwest::header::RANGE, range)
+}
+
+fn process_response(
+    response: &reqwest::Response,
+    offset: u64,
+) -> Result<Option<u64>, IoError> {
+    if response.status() == StatusCode::OK {
+        if offset != 0 {
+            #[cfg(feature = "nightly")]
+            return Err(ErrorKind::NotSeekable.into());
+            #[cfg(not(feature = "nightly"))]
+            return Err(ErrorKind::Unsupported.into());
+        }
+    } else if response.status() != StatusCode::PARTIAL_CONTENT {
+        let error = HttpResponseStatusError(response.status());
+        return Err(to_io_error(error));
+    }
+    Ok(determine_size(offset, response))
+}
 
 fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
@@ -102,36 +223,45 @@ fn determine_size(offset: u64, response: &reqwest::Response) -> Option<u64> {
     }
 }
 
-/// Send a request with a `Range` header,
-/// returning a future for the response stream.
-fn send_request(request: &RequestBuilder, offset: u64) -> RequestStreamFuture {
-    let request = request
-        .try_clone()
-        .expect("request contains streaming body");
-    request
-        .header(reqwest::header::RANGE, format!("bytes={offset}-"))
-        .send()
-        .map(move |result| {
-            result
-                .and_then(|response| response.error_for_status())
-                .map_err(to_io_error)
-                .and_then(|response| {
-                    if response.status() == StatusCode::OK {
-                        if offset != 0 {
-                            return Err(ErrorKind::NotSeekable.into());
-                        }
-                    } else if response.status() != StatusCode::PARTIAL_CONTENT {
-                        let error = HttpResponseStatusError(response.status());
-                        return Err(to_io_error(error));
-                    }
-                    let size = determine_size(offset, &response);
-                    let stream = response
-                        .bytes_stream()
-                        .map(|result| result.map_err(to_io_error));
+#[cfg(feature = "tokio_io")]
+fn fastforward<R: AsyncRead + Unpin, const BUFFER: usize>(
+    reader: Pin<&mut R>,
+    delta: u64,
+    context: &mut Context<'_>,
+) -> (u64, u64, Poll<Result<(), IoError>>) {
+    fastforward_impl::<R, _, BUFFER>(
+        reader,
+        delta,
+        context,
+        |reader, context, buffer| {
+            let mut array = [std::mem::MaybeUninit::uninit(); BUFFER];
+            let buffer_size = buffer.len();
+            let mut read_buf = ReadBuf::uninit(&mut array[0..buffer_size]);
+            match reader.poll_read(context, &mut read_buf) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        },
+    )
+}
 
-                    Ok((size, stream))
-                })
-        })
+#[cfg(feature = "futures_io")]
+fn fastforward<R: AsyncRead + Unpin, const BUFFER: usize>(
+    reader: Pin<&mut R>,
+    delta: u64,
+    context: &mut Context<'_>,
+) -> (u64, u64, Poll<Result<(), IoError>>) {
+    fastforward_impl::<R, _, BUFFER>(
+        reader,
+        delta,
+        context,
+        |reader, context, buffer| match reader.poll_read(context, buffer) {
+            Poll::Ready(Ok(read)) => Poll::Ready(Ok(read)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        },
+    )
 }
 
 /// Try to read `delta` bytes from a stream,
@@ -139,25 +269,35 @@ fn send_request(request: &RequestBuilder, offset: u64) -> RequestStreamFuture {
 ///
 /// Return `Ok` if the fastforward is complete,
 /// or if EOF is reached (at the first empty read).
-fn fastforward<R: AsyncRead, const BUFFER: usize>(
+fn fastforward_impl<R, F, const BUFFER: usize>(
     mut reader: Pin<&mut R>,
     delta: u64,
     context: &mut Context<'_>,
-) -> (u64, u64, Poll<Result<(), IoError>>) {
-    let mut array = [std::mem::MaybeUninit::uninit(); BUFFER];
+    poll_read_fn: F,
+) -> (u64, u64, Poll<Result<(), IoError>>)
+where
+    R: Unpin,
+    F: FnMut(
+        Pin<&mut R>,
+        &mut Context<'_>,
+        &mut [u8],
+    ) -> Poll<Result<usize, IoError>>,
+{
+    let mut buffer = vec![0u8; BUFFER];
     let mut remaining = delta;
+    let mut poll_read_fn = poll_read_fn;
+
     let poll = loop {
         assert!(remaining > 0);
         let buffer_size = (remaining as usize).min(BUFFER);
-        let mut buffer = ReadBuf::uninit(&mut array[0..buffer_size]);
-        match reader.as_mut().poll_read(context, &mut buffer) {
-            Poll::Ready(Ok(())) => {
-                let read = buffer.filled().len() as u64;
+        let buffer = &mut buffer[..buffer_size];
+        match poll_read_fn(reader.as_mut(), context, buffer) {
+            Poll::Ready(Ok(read)) => {
                 if read == 0 {
                     // reached EOF
                     break Poll::Ready(Ok(()));
                 } else {
-                    remaining = remaining.checked_sub(read).unwrap();
+                    remaining = remaining.checked_sub(read as u64).unwrap();
                     if remaining == 0 {
                         break Poll::Ready(Ok(()));
                     } else {
@@ -165,7 +305,8 @@ fn fastforward<R: AsyncRead, const BUFFER: usize>(
                     }
                 }
             }
-            other => break other,
+            Poll::Ready(Err(e)) => break Poll::Ready(Err(e)),
+            Poll::Pending => break Poll::Pending,
         }
     };
     let read = delta.checked_sub(remaining).unwrap();
@@ -204,7 +345,7 @@ enum State<P, R> {
 ///
 /// If the webserver does not support range requests,
 /// seeking to anything other than the start of the file
-/// will return a [`NotSeekable`] error
+/// will either return a [`NotSeekable`] or [`Unsupported`] error
 /// (excluding [fast-forwards](#fast-forward)).
 /// Note that the `Accept-Ranges` response header is not
 /// used to check range request support before sending one.
@@ -233,7 +374,7 @@ enum State<P, R> {
 /// # Reading
 ///
 /// Reads are implemented by wrapping the response body
-/// stream in [`StreamReader`].
+/// stream in either [`StreamReader`] or [`IntoAsyncRead`].
 ///
 /// # Seeking
 ///
@@ -281,11 +422,17 @@ pub struct RequestFile<
     /// The request template.
     request: RequestBuilder,
     /// The state of the HTTP request.
+    #[cfg(feature = "tokio_io")]
     state: State<RequestStreamFuture, StreamReader<RequestStream, Bytes>>,
+    #[cfg(feature = "futures_io")]
+    state: State<RequestStreamFuture, IntoAsyncRead<RequestStream>>,
     /// Track the size of the response body.
     size_: Option<u64>,
     /// Track the current position in the response body.
     position: u64,
+    /// Track the current seek operation
+    #[cfg(feature = "futures_io")]
+    seek_position: Option<SeekFrom>,
 }
 
 impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
@@ -340,6 +487,8 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
             state: State::Initial,
             size_: size.into(),
             position: 0,
+            #[cfg(feature = "futures_io")]
+            seek_position: None,
         }
     }
 
@@ -360,7 +509,6 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
 
     /// Perform the HTTP request so the response is ready to be read.
     pub async fn prepare(&mut self) -> Result<(), IoError> {
-        use tokio::io::AsyncSeekExt;
         self.seek(SeekFrom::Current(0)).await.map(|_| ())
     }
 }
@@ -409,7 +557,11 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
     /// Drive the state from `State::Initial` to `State::Pending`.
     fn drive_initial(&mut self) {
         if let State::Initial = self.state {
-            let future = Box::pin(send_request(self.request, *self.position));
+            let future = Box::pin(send_request(
+                self.request,
+                *self.position,
+                *self.size_,
+            ));
             *self.state = State::Pending(future);
         }
     }
@@ -422,7 +574,16 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
         if let State::Pending(future) = self.state {
             future.as_mut().poll(context).map_ok(move |(size, stream)| {
                 *self.size_ = self.size_.or(size);
-                *self.state = State::Ready(Box::pin(StreamReader::new(stream)));
+                #[cfg(feature = "tokio_io")]
+                {
+                    *self.state =
+                        State::Ready(Box::pin(StreamReader::new(stream)));
+                }
+                #[cfg(feature = "futures_io")]
+                {
+                    *self.state =
+                        State::Ready(Box::pin(stream.into_async_read()));
+                }
             })
         } else {
             Poll::Ready(Ok(()))
@@ -467,8 +628,6 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
         &'a mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), IoError>> {
-        use futures_util::ready;
-
         self.drive_initial();
         assert!(!matches!(self.state, State::Initial));
 
@@ -484,8 +643,31 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
         assert!(matches!(self.state, State::Ready(_)));
         Poll::Ready(Ok(()))
     }
+
+    fn prepare_seek(&mut self, final_position: u64) {
+        let initial_position = *self.position;
+        if initial_position != final_position {
+            let delta_forward = final_position.saturating_sub(initial_position);
+            if 0 < delta_forward && delta_forward <= FF_WINDOW {
+                // seeking forwards by a small leap
+                if let State::Ready(reader) =
+                    std::mem::replace(self.state, State::Transient)
+                {
+                    *self.state = State::Seeking(reader, delta_forward);
+                } else {
+                    *self.position = final_position;
+                    *self.state = State::Initial;
+                }
+            } else {
+                // seeking backwards or a large leap forwards
+                *self.position = final_position;
+                *self.state = State::Initial;
+            }
+        }
+    }
 }
 
+#[cfg(feature = "tokio_io")]
 impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncRead
     for RequestFile<FF_WINDOW, FF_BUFFER>
 {
@@ -511,6 +693,7 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncRead
     }
 }
 
+#[cfg(feature = "tokio_io")]
 impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncSeek
     for RequestFile<FF_WINDOW, FF_BUFFER>
 {
@@ -518,27 +701,9 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncSeek
         self: Pin<&mut Self>,
         position: SeekFrom,
     ) -> Result<(), IoError> {
-        let this = self.project();
-        let initial_position = *this.position;
-        let final_position = this.resolve_seek_position(position)?;
-        if initial_position != final_position {
-            let delta_forward = final_position.saturating_sub(initial_position);
-            if 0 < delta_forward && delta_forward <= FF_WINDOW {
-                // seeking forwards by a small leap
-                if let State::Ready(reader) =
-                    std::mem::replace(this.state, State::Transient)
-                {
-                    *this.state = State::Seeking(reader, delta_forward);
-                } else {
-                    *this.position = final_position;
-                    *this.state = State::Initial;
-                }
-            } else {
-                // seeking backwards or a large leap forwards
-                *this.position = final_position;
-                *this.state = State::Initial;
-            }
-        }
+        let mut this = self.project();
+        let absolute_position = this.resolve_seek_position(position)?;
+        this.prepare_seek(absolute_position);
         Ok(())
     }
 
@@ -551,11 +716,72 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncSeek
     }
 }
 
+#[cfg(feature = "futures_io")]
+impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncRead
+    for RequestFile<FF_WINDOW, FF_BUFFER>
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut this = self.project();
+        let reader = match this.poll_drive(cx) {
+            Poll::Ready(Ok(())) => match this.state {
+                State::Ready(reader) => reader.as_mut(),
+                _ => unreachable!(),
+            },
+            Poll::Pending => {
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(err)) => {
+                return Poll::Ready(Err(err));
+            }
+        };
+        reader.poll_read(cx, buf).map_ok(|read| {
+            *this.position = this.position.saturating_add(read as u64);
+            read
+        })
+    }
+}
+
+#[cfg(feature = "futures_io")]
+impl<const FF_WINDOW: u64, const FF_BUFFER: usize> AsyncSeek
+    for RequestFile<FF_WINDOW, FF_BUFFER>
+{
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<std::io::Result<u64>> {
+        let mut this = self.project();
+        if this.seek_position != &Some(pos) {
+            // Ensure previous seeks have finished before starting a new one
+            ready!(this.poll_drive(cx))?;
+            let absolute_position = match this.resolve_seek_position(pos) {
+                Ok(pos) => pos,
+                Err(e) => return Poll::Ready(Err(e)),
+            };
+            *this.seek_position = Some(pos);
+            this.prepare_seek(absolute_position);
+        }
+        let result = this.poll_drive(cx).map_ok(|_| *this.position);
+        if let Poll::Ready(_) = &result {
+            *this.seek_position = None;
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::RequestFile;
     use std::io::SeekFrom;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    #[cfg(feature = "tokio_io")]
+    use tokio::io::{AsyncReadExt, AsyncSeek, AsyncSeekExt};
+
+    #[cfg(feature = "futures_io")]
+    use futures_util::io::{AsyncReadExt, AsyncSeekExt};
 
     #[derive(Debug, serde::Deserialize)]
     pub struct QueryParams {
@@ -893,19 +1119,23 @@ mod tests {
         let client = reqwest::Client::new();
         let request = client.get(format!("{url}/?data=abc"));
         let file: RequestFile = RequestFile::new(request);
-
-        // NOTE: We cannot use AsyncReadExt.seek() here
-        // since that does a `poll_complete()` before `start_seek()`
-        // which leaves the file in the `Ready` state.
-        use futures_util::future::poll_fn;
-        use tokio::io::AsyncSeek;
+        let pos = SeekFrom::Start(4);
         tokio::pin!(file);
-        file.as_mut()
-            .start_seek(SeekFrom::Start(4))
-            .expect("start seek error");
-        let pos = poll_fn(|context| file.as_mut().poll_complete(context))
-            .await
-            .expect("complete seek error");
+        #[cfg(feature = "tokio_io")]
+        let pos = {
+            // NOTE: We cannot use AsyncReadExt.seek() here
+            // since that does a `poll_complete()` before `start_seek()`
+            // which leaves the file in the `Ready` state.
+            use futures_util::future::poll_fn;
+
+            file.as_mut().start_seek(pos).expect("start seek error");
+            poll_fn(|context| file.as_mut().poll_complete(context))
+                .await
+                .expect("complete seek error")
+        };
+
+        #[cfg(feature = "futures_io")]
+        let pos = { file.seek(pos).await.expect("seek error") };
         assert_eq!(pos, 4);
     }
 
@@ -1028,7 +1258,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "seek error: Kind(NotSeekable)")]
+    #[cfg_attr(
+        feature = "nightly",
+        should_panic(expected = "seek error: Kind(NotSeekable)")
+    )]
+    #[cfg_attr(
+        not(feature = "nightly"),
+        should_panic(expected = "seek error: Kind(Unsupported)")
+    )]
     async fn test_seek_no_range_support() {
         let url = start_server();
         let client = reqwest::Client::new();
